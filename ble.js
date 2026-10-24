@@ -1,0 +1,1597 @@
+// The link: everything between the page and the receiver's GATT service,
+// with no DOM in it. app.js renders whatever is in `S` and calls the
+// actions below; every change to `S` ends in emit(), which re-renders.
+//
+// Everything protocol-shaped must match firmware/main/ble.cpp (JSON shapes:
+// daemon/fans.hpp and daemon/strip_remote.hpp):
+//   service a5f20001-8f11-4e0e-9b3a-0bc250e0c001
+//   control a5f20002-... : write  token(16, NUL-padded) + op(1) [+ args]
+//                          op 0x01=on 0x02=graceful shutdown 0x03=hard off
+//                          op 0x10=set a fan slot's standalone record, args
+//                          slot(1) + the record (encodeRecord) — the
+//                          receiver's own; a record with no output removes it
+//                          op 0x20=set the power switch's tunings, args
+//                          hold_ms(2) boot_timeout_ms(2) sense_low_mv(2)
+//                          sense_high_mv(2), LE — the receiver's own
+//                          op 0x21=set the power switch's wake input pin,
+//                          args pin(1), 0xFF = none — the receiver's own
+//   status  a5f20003-... : read/notify  1 byte  0=off 1=booting 2=on
+//   fans    a5f20004-... : read/notify  the receiver's own fan view (parseFans)
+//   info    a5f20006-... : read  firmware version + heap + the free input
+//                          pins (a gpio:N fan input, the wake input), the
+//                          board's header map, the free output pins
+//   fansa   a5f20009-... : read/notify  the receiver's standalone fan settings
+//   pwr     a5f2000b-... : read/notify  the receiver's own power switch view
+//                          (parsePwr): wiring, tunings in force, the sense
+//                          wire's live reading — notified 1 Hz while subscribed
+//   page    a5f2000d-... : write [view][page], read the page — a daemon view,
+//                          whole (readPaged)
+//   views   a5f2000e-... : notify  view(1) len(2, LE, the whole view's) + as
+//                          much of the view as fits; write token(16) + view(1)
+//                          + an edit. The daemon's views, JSON text, by id
+//                          (VIEW, protocol.hpp VIEW_*): the fan list
+//                          (fans.hpp; edits are its shapes), its readings, the
+//                          strip (strip_remote.hpp; a partial edit), the
+//                          sensor catalogue {"chip":{"label":61.0},"_outs":[...]}
+//                          (fans.hpp sensorsJson), the power switch
+//                          (power_remote.hpp; a partial edit), and Steam's
+//                          state and installed games (steam_remote.hpp; an
+//                          edit is a request). Subscribing is what starts
+//                          the daemon's readings.
+// A receiver with only the first two has no dashboard, and the power remote
+// works as before; one without views runs firmware from before them.
+//
+// Reconnects on its own: the chooser grants a persistent permission, so
+// navigator.bluetooth.getDevices() can hand the devices back on the next
+// visit. Chrome refuses to gatt.connect() a device it hasn't seen this
+// session, so the page first calls watchAdvertisements() and waits for one
+// advertisement (the receiver advertises in both PSU states) before
+// connecting — the sequence Chrome's own sample uses.
+//
+// CAVEAT: as of 2026, auto-reconnect needs TWO chrome://flags (desktop AND
+// Android): #enable-experimental-web-platform-features unlocks the
+// getDevices()/watchAdvertisements() APIs, and — separately —
+// #enable-web-bluetooth-new-permissions-backend makes the chooser grant
+// persist across sessions. Without either, tap-to-connect always works.
+//
+// iOS: Safari has no Web Bluetooth. Bluefy (free) and WebBLE (paid) are
+// WKWebView shells that inject a spec-shaped navigator.bluetooth bridged to
+// CoreBluetooth; this module uses nothing beyond the spec, so it runs in
+// them as-is, skipping the advertisement dance (CoreBluetooth connects a
+// known peripheral without a scan) and falling back to writeValue() where
+// writeValueWithResponse() is missing.
+
+export const SVC    = 'a5f20001-8f11-4e0e-9b3a-0bc250e0c001';
+const CTRL   = 'a5f20002-8f11-4e0e-9b3a-0bc250e0c001';
+const STAT   = 'a5f20003-8f11-4e0e-9b3a-0bc250e0c001';
+const FANS   = 'a5f20004-8f11-4e0e-9b3a-0bc250e0c001';
+const INFO   = 'a5f20006-8f11-4e0e-9b3a-0bc250e0c001';
+const FANSA  = 'a5f20009-8f11-4e0e-9b3a-0bc250e0c001';
+const PWR    = 'a5f2000b-8f11-4e0e-9b3a-0bc250e0c001';
+const PAGE   = 'a5f2000d-8f11-4e0e-9b3a-0bc250e0c001';
+const VIEWS  = 'a5f2000e-8f11-4e0e-9b3a-0bc250e0c001';
+// the daemon's views by id (protocol.hpp VIEW_*)
+export const VIEW = { fancfg: 0, telem: 1, strip: 2, sensors: 3, power: 4, steam: 5, library: 6 };
+export const OP_ON = 0x01, OP_SHUTDOWN = 0x02, OP_HARD_OFF = 0x03;
+export const OP_FAN_HEADER = 0x10;   // + slot(1) + the slot's record (SA_HEADER_LEN, encodeRecord)
+export const OP_PWR_TUNING = 0x20;   // + hold_ms(2) boot_ms(2) low_mv(2) high_mv(2)
+export const OP_PWR_WAKE = 0x21;     // + pin(1), 0xFF = no wake input
+export const TOKEN_LEN = 16;
+export const DEFAULT_NAME = 'BC250'; // what the firmware advertises without a ble_remote.name
+
+// iPhone / iPad (iPadOS 13+ claims to be a Mac; touch points tell). Bluefy
+// and WebBLE run in a WKWebView, so their UA is an iOS Safari UA as well.
+export const IOS = /iP(hone|ad|od)/.test(navigator.userAgent) ||
+                   (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+export const BLUEFY_STORE = 'https://apps.apple.com/app/bluefy-web-ble-browser/id1492822055';
+// Bluefy registers a URL scheme that opens a page inside it (its vendor's
+// documented way to hand a page over from Safari)
+export const bluefyLink = () => 'bluefy://open?url=' + encodeURIComponent(location.href.split('#')[0]);
+
+// ---- the provider: the link and the stored settings come from here ----
+// The page's transport is a strategy: anything shaped like Web Bluetooth
+// (getDevices, requestDevice, and the devices, GATT servers and
+// characteristics they hand out) plus anything shaped like localStorage.
+// The browser's own by default; useProvider() swaps in another before boot()
+// — demo-ble.js's simulated receiver, or any other source speaking the
+// protocol above. Nothing below knows which one it is talking to.
+let bt = navigator.bluetooth || null, storage = null; // null: localStorage, looked up late (it can throw)
+export let HAS_BT = !!bt;
+export function useProvider(p) {
+  bt = p.bluetooth || null; storage = p.storage || null;
+  HAS_BT = !!bt;
+  loadReceivers();
+}
+
+// ---- the store ----
+export const S = {
+  device: null, ctrl: null, stat: null,   // the selected receiver + its live GATT
+  fansChr: null, saChr: null, pwrChr: null, infoChr: null, pageChr: null, viewsChr: null,
+  psu: -1,         // last status byte seen, -1 = unknown
+  busy: false,     // a user-initiated connect or write in flight
+  attempt: null,   // the device an auto-reconnect (watch or connect) is live for
+  editToken: false,// the token box is open on request (change / rejected)
+  msg: { text: '', hint: false, html: false }, // one line under the header; errors, or capability hints
+  fans: null, sa: null, cfg: null, telem: null, info: null, scfg: null,
+  pwr: null,       // the receiver's power switch view (parsePwr)
+  pcfg: null,      // the daemon's power switch view (parsePwrCfg)
+  sens: null,      // the sensor catalogue: [{ spec, chip, label, pwm, value }] (parseSensors)
+  sensMore: 0,     // sensors the catalogue left out for size (its "_more")
+  outs: null,      // the host's pwm outputs: [{ spec, duty, rpm, writable }] (parseSensors)
+  steam: null,     // what Steam is doing (parseSteam)
+  lib: null,       // the installed games, as the daemon last sent them (parseLibrary; see library())
+  saving: null,    // 'p' or a fan card's key: a write waiting for its answer
+  note: null,      // the one status line: { text, cls } — a save's progress, or a refusal
+};
+const subs = new Set();
+export const subscribe = fn => { subs.add(fn); return () => subs.delete(fn); };
+export const emit = () => { for (const fn of subs) fn(); };
+
+let retryTimer = 0, watchAbort = null, saveTimer = 0;
+
+// ---- storage (localStorage; wrapped — storage can throw in private windows) ----
+const store = {
+  get(k) { try { return (storage || localStorage).getItem(k) || ''; } catch { return ''; } },
+  set(k, v) { try { (storage || localStorage).setItem(k, v); } catch {} },
+};
+export const prefs = store;
+
+// Every receiver the chooser has ever granted, by BluetoothDevice.id:
+// { name, token }. The name caches what the board advertised so the list
+// renders before (or without) getDevices(); the token is per board because
+// each is flashed with its own ble_remote.token — a board without one of
+// its own uses the shared 'ble-token', the first token ever entered here.
+export const receivers = {};
+const saveReceivers = () => store.set('ble-receivers', JSON.stringify(receivers));
+// devices Chrome has handed out this session (getDevices / chooser), by id —
+// only these can be connected without going through the chooser again
+export const known = new Map();
+
+// (re)read from the provider's storage
+function loadReceivers() {
+  for (const k of Object.keys(receivers)) delete receivers[k];
+  try { Object.assign(receivers, JSON.parse(store.get('ble-receivers')) || {}); } catch {}
+  // earlier versions of this page knew exactly one receiver
+  if (store.get('ble-device')) {
+    receivers[store.get('ble-device')] ||= { name: '', token: '' };
+    store.set('ble-current', store.get('ble-device'));
+    store.set('ble-device', '');
+    saveReceivers();
+  }
+}
+loadReceivers();
+
+export const token = () => (S.device && receivers[S.device.id]?.token) || store.get('ble-token');
+export const anyKnown = () => Object.keys(receivers).length > 0;
+export const currentId = () => S.device?.id || store.get('ble-current');
+export const connected = () => !!(S.device && S.device.gatt.connected);
+
+function tokenBytes() {
+  const bytes = new Uint8Array(TOKEN_LEN); // NUL padding, as the firmware compares
+  const t = token();
+  for (let i = 0; i < Math.min(t.length, TOKEN_LEN); i++) bytes[i] = t.charCodeAt(i);
+  return bytes;
+}
+
+function remember(d) {
+  const r = receivers[d.id] ||= { name: '', token: '' };
+  if (d.name) r.name = d.name;
+  known.set(d.id, d);
+  saveReceivers();
+  syncPresence();
+}
+
+export function say(text, hint = false, html = false) { S.msg = { text, hint, html }; emit(); }
+
+// display names, with twins (two boards both flashed as "BC250") numbered
+export function labels() {
+  const ids = Object.keys(receivers).sort((a, b) =>
+    (receivers[a].name || DEFAULT_NAME).localeCompare(receivers[b].name || DEFAULT_NAME) || a.localeCompare(b));
+  const seen = {}, out = {};
+  for (const id of ids) {
+    const base = receivers[id].name || DEFAULT_NAME;
+    const n = seen[base] = (seen[base] || 0) + 1;
+    out[id] = n > 1 ? `${base} (${n})` : base;
+  }
+  return { ids, labels: out };
+}
+export const label = id => labels().labels[id] || receivers[id]?.name || DEFAULT_NAME;
+
+// ---- GATT ----
+// Chrome does not queue GATT operations: on Android a read or write started
+// while another is still in flight on the same device fails outright,
+// whatever the characteristic. Every operation on the link goes through this
+// one chain, so a tap on the power button can't land in the middle of a
+// dashboard read. An operation that never settles would park everything
+// behind it, so each gets a deadline; a disconnect or a receiver switch
+// starts a fresh chain. A deadline that fires is taken at its word: the link
+// is dropped, and the usual auto-reconnect brings the board back.
+//
+// Every operation belongs to the board its characteristic is on. Work for a
+// board that has since been switched away from (a dashboard still loading, a
+// re-read, a write) is never issued, and one that was in flight at the
+// switch has its answer dropped: it rejects with SUPERSEDED, which callers
+// pass over in silence, and nothing of the old board lands in `S`. Issuing
+// GATT calls on the board just disconnected, while connecting the next,
+// is what crashed Chrome's page on Android.
+const GATT_OP_TIMEOUT_MS = 10000;
+export const SUPERSEDED = new Error('another receiver was selected');
+let gattChain = Promise.resolve();
+// the board a characteristic is on
+const deviceOf = c => c?.service?.device || S.device;
+function gattQueue(c, op) {
+  const d = deviceOf(c);
+  const p = gattChain.then(() => new Promise((resolve, reject) => {
+    if (S.device !== d) { reject(SUPERSEDED); return; }
+    const t = setTimeout(() => {
+      reject(new Error('Bluetooth operation timed out — the link may be gone'));
+      try { if (S.device === d) d.gatt.disconnect(); } catch {}
+    }, GATT_OP_TIMEOUT_MS);
+    Promise.resolve().then(op)
+      .then(v => S.device === d ? resolve(v) : reject(SUPERSEDED), e => reject(S.device === d ? e : SUPERSEDED))
+      .finally(() => clearTimeout(t));
+  }));
+  gattChain = p.then(() => {}, () => {});
+  return p;
+}
+const gattReset = () => { gattChain = pagedChain = Promise.resolve(); };
+const gattRead = c => gattQueue(c, () => c.readValue());
+// writeValueWithResponse is newer than the iOS polyfills' first releases —
+// the deprecated writeValue is the same thing where the new name is missing
+const gattWrite = (c, v) => gattQueue(c, () =>
+  c.writeValueWithResponse ? c.writeValueWithResponse(v) : c.writeValue(v));
+const gattSubscribe = c => gattQueue(c, () => c.startNotifications());
+
+// top-level named handlers: addEventListener dedupes identical refs, so
+// re-attaching across reconnects can't stack them
+const onStatusEvent = e => { if (e.target === S.stat) onStatus(e.target.value.getUint8(0)); };
+
+// make d the selected receiver: the live connection (if any) moves with it
+function attach(d) {
+  watchAbort?.abort(); // a pick/switch supersedes any pending auto-attempt
+  if (S.device && S.device !== d && S.device.gatt.connected) S.device.gatt.disconnect();
+  S.device = d;
+  syncPresence(); // the reconnect's watch takes over this board's advertisements
+  S.ctrl = S.stat = null;
+  S.psu = -1;
+  S.editToken = false;
+  gattReset();
+  dashReset();
+  store.set('ble-current', d.id);
+  d.addEventListener('gattserverdisconnected', onDisconnected);
+}
+
+async function open() {
+  const d = S.device;
+  const gatt = await d.gatt.connect();
+  const svc = await gatt.getPrimaryService(SVC);
+  const c = await svc.getCharacteristic(CTRL);
+  const s = await svc.getCharacteristic(STAT);
+  await gattSubscribe(s);
+  const first = (await gattRead(s)).getUint8(0);
+  if (S.device !== d) { gatt.disconnect(); return; } // superseded while we were at it
+  S.ctrl = c; S.stat = s;
+  s.addEventListener('characteristicvaluechanged', onStatusEvent);
+  onStatus(first);
+  remember(d);
+  say('');
+  dashOpen(svc).catch(e => { if (e !== SUPERSEDED) say(`Dashboard: ${e.message}`); });
+}
+
+function onStatus(v) { S.psu = v; emit(); }
+
+function onDisconnected(e) {
+  if (e.target !== S.device) return; // a stale device we already replaced
+  S.ctrl = S.stat = null;
+  S.psu = -1;
+  gattReset();
+  dashReset();
+  emit();
+  scheduleReconnect(1000);
+}
+
+// Chrome won't gatt.connect() a getDevices() device it hasn't discovered
+// this session: watch its advertisements and connect on the first one seen.
+// Resolves 'seen' (in range, connect now), 'fallback' (watch API missing or
+// refused — attempt a blind connect), or 'aborted' (superseded). On iOS the
+// blind connect IS the right path.
+function waitForAdvertisement(d) {
+  if (IOS || !d.watchAdvertisements) return Promise.resolve('fallback');
+  return new Promise(resolve => {
+    watchAbort?.abort();
+    const ac = watchAbort = new AbortController();
+    ac.signal.addEventListener('abort', () => resolve('aborted'));
+    d.addEventListener('advertisementreceived', () => { resolve('seen'); ac.abort(); },
+                       { once: true, signal: ac.signal });
+    d.watchAdvertisements({ signal: ac.signal }).catch(() => { resolve('fallback'); ac.abort(); });
+  });
+}
+
+// auto-reconnect: the advertisement watch pends until the receiver is in
+// range, so one live attempt is the whole loop; the retry timer only guards
+// against failures after that. The attempt is pinned to a device: switching
+// boards while one pends lets the stale attempt fall through.
+async function reconnect() {
+  if (!S.device || S.device.gatt.connected || S.attempt === S.device || S.busy) return;
+  const d = S.attempt = S.device;
+  emit();
+  try {
+    const how = await waitForAdvertisement(d);
+    if (how === 'aborted' || S.device !== d || d.gatt.connected) return;
+    await open();
+  } catch (e) {
+    if (S.device !== d) return; // died because we switched away — not news
+    say(`Auto-reconnect: ${e.message} — retrying.`, true);
+    scheduleReconnect(10000);
+  } finally { if (S.attempt === d) S.attempt = null; emit(); }
+}
+
+function scheduleReconnect(ms) {
+  clearTimeout(retryTimer);
+  retryTimer = setTimeout(reconnect, ms);
+}
+
+// on load (and when the tab returns — Chrome drops pending connects in the
+// background), pick up the boards the chooser permitted before and connect
+// to the one used last
+export async function resume() {
+  if (S.device) { reconnect(); return; }
+  if (!token() || !HAS_BT) return;
+  if (!bt.getDevices) {
+    // stock Chrome (2026): persistent-device APIs still flag-gated; on iOS
+    // it is the browser app — there is no flag to name
+    say(IOS
+      ? 'This browser can’t remember receivers between visits — tap to connect (Bluefy can).'
+      : 'Auto-reconnect needs “Experimental Web Platform features” turned on in ' +
+        '<code>chrome://flags</code> — until then, tap to connect.', true, true);
+    return;
+  }
+  try {
+    const list = await bt.getDevices();
+    for (const d of list) remember(d);
+    const d = list.find(x => x.id === store.get('ble-current')) || list[0];
+    if (!d) {
+      // we HAVE connected before (receivers are stored) yet Chrome
+      // remembers nothing. One tap re-grants it; whether THAT grant then
+      // survives the session is the second flag's doing
+      if (anyKnown())
+        say(IOS
+          ? 'The browser holds no permission for the receiver — tap to connect once.'
+          : 'Chrome holds no permission for the receiver — tap to connect once. If this keeps ' +
+            'coming back, enable <code>chrome://flags/#enable-web-bluetooth-new-permissions-backend</code> ' +
+            'and relaunch Chrome.', true, true);
+      emit();
+      return;
+    }
+    attach(d);
+    reconnect();
+  } catch (e) { say(`Auto-reconnect failed: ${e.message}`); }
+}
+
+// the chooser: grants (and thereby adds) a receiver, then connects to it
+async function pick() {
+  // the manufacturer data is the advertised host state (see presence below):
+  // Chrome only passes it to a page whose grant asked for it
+  const d = await bt.requestDevice({ filters: [{ services: [SVC] }], optionalManufacturerData: [ADV_MFG_ID] });
+  remember(d);
+  if (S.device && S.device.id === d.id && S.device.gatt.connected) {
+    store.set('ble-current', d.id);
+    return; // picked the board we're already on
+  }
+  attach(d);
+  emit();
+  await open();
+}
+
+// a user-driven connect: the chooser (new receiver, permission revoked —
+// the manual escape hatch while an auto-reconnect pends)
+export async function connect() {
+  if (S.busy) return;
+  S.busy = true; say('');
+  try { await pick(); }
+  catch (e) {
+    if (e.name !== 'NotFoundError' && e !== SUPERSEDED) say(`Couldn’t connect: ${e.message}`); // chooser dismissed = not an error
+  } finally { S.busy = false; emit(); }
+}
+
+// the receiver list: a board Chrome handed us this session connects directly
+// (through the advertisement dance); anything else needs the chooser
+export async function select(id) {
+  if (S.busy) return; // never yank a board mid-write
+  if (id && known.has(id)) {
+    store.set('ble-current', id);
+    if (S.device?.id === id) { reconnect(); return; }
+    attach(known.get(id));
+    say('');
+    reconnect();
+    return;
+  }
+  await connect();
+}
+
+// ---- presence: which known receivers are nearby, and what their host is doing ----
+// While the Receiver tab is up, the page watches every receiver Chrome handed
+// it this session for advertisements. Each one carries the host state
+// (firmware ble.cpp: manufacturer data under 0xFFFF = ver(1) = 1, state(1)),
+// absent on older firmware or on a grant from before this page asked for it.
+// A board counts as nearby for NEARBY_MS after its last advertisement — the
+// receiver advertises every 1.3 s at its slowest, and Android batches scan
+// results. The selected board is left to the reconnect's own watch (two
+// watches on one device cancel each other in Chrome); its advertisements
+// land in the same handler. A connected board doesn't advertise: the link
+// is the proof, and S.psu its state.
+const ADV_MFG_ID = 0xFFFF;
+const NEARBY_MS = 10000;
+const presence = new Map(); // id -> { at, psu: 0..2 | null }
+const presenceWatch = new Map(); // id -> AbortController
+let scanning = false, presenceTick = 0;
+
+const onAdvertisement = e => {
+  const m = e.manufacturerData && e.manufacturerData.get(ADV_MFG_ID);
+  const psu = m && m.byteLength >= 2 && m.getUint8(0) === 1 && m.getUint8(1) <= 2 ? m.getUint8(1) : null;
+  const was = presence.get(e.device.id);
+  presence.set(e.device.id, { at: Date.now(), psu });
+  if (!was || Date.now() - was.at > NEARBY_MS || was.psu !== psu) emit();
+};
+
+function syncPresence() {
+  for (const [id, d] of known) {
+    d.addEventListener('advertisementreceived', onAdvertisement); // deduped: the same ref
+    const want = scanning && d !== S.device && !IOS && !!d.watchAdvertisements;
+    const ac = presenceWatch.get(id);
+    if (want && !ac) {
+      const c = new AbortController();
+      presenceWatch.set(id, c);
+      d.watchAdvertisements({ signal: c.signal }).catch(() => { if (presenceWatch.get(id) === c) presenceWatch.delete(id); });
+    } else if (!want && ac) { presenceWatch.delete(id); ac.abort(); }
+  }
+}
+
+// the Receiver tab's on/off switch for the watch: scanning costs the phone's
+// battery, so it runs only while the list is on screen
+export function watchNearby(on) {
+  scanning = on;
+  clearInterval(presenceTick);
+  if (on) presenceTick = setInterval(emit, 2000); // "nearby" ages out without an event
+  syncPresence();
+}
+
+// what the list says about a receiver: { near: true|false|null, psu: 0..2|null }.
+// near is null where the page can't tell (no watch API, or a board
+// Chrome hasn't handed over this session)
+export function presenceOf(id) {
+  if (S.device?.id === id && connected()) return { near: true, psu: S.psu >= 0 ? S.psu : null };
+  const d = known.get(id);
+  if (IOS || !d || !d.watchAdvertisements) return { near: null, psu: null };
+  const p = presence.get(id);
+  return p && Date.now() - p.at < NEARBY_MS ? { near: true, psu: p.psu } : { near: false, psu: null };
+}
+
+async function writeOp(op, ...args) {
+  const buf = new Uint8Array(TOKEN_LEN + 1 + args.length);
+  buf.set(tokenBytes());
+  buf[TOKEN_LEN] = op;
+  buf.set(args, TOKEN_LEN + 1);
+  try {
+    await gattWrite(S.ctrl, buf);
+    say('');
+  } catch (e) {
+    if (e === SUPERSEDED) throw e; // the board is gone from the screen: nothing to say
+    if (tokenRejected(e)) {
+      say(`Token rejected by ${label(S.device.id)} — enter the one it was flashed with.`);
+      S.editToken = true;
+    } else say(`Write failed: ${e.message}${writeHint(e)}`);
+    throw e;
+  }
+}
+
+// the power ops, from the ring and its sheet
+export async function power(op) {
+  if (S.busy || !connected()) return;
+  S.busy = true; say('');
+  try { await writeOp(op); } catch {} // writeOp said why
+  S.busy = false; emit();
+}
+
+// What a failed write means. The firmware answers a wrong token with "write
+// not permitted" — the ATT code for an application-level refusal. On
+// Android, Chrome folds almost everything else into "GATT Error Unknown."
+// (a full message queue, a bad length, link loss, and the "insufficient
+// authentication" firmware before Sep 2026 answered a wrong token with).
+const tokenRejected = e => /not permitted|not authori[sz]ed|not paired|authentication/i.test(e.message);
+const writeHint = e => /GATT Error Unknown/i.test(e.message)
+  ? ' — Android reports several things this way: the link dropping, the receiver’s queue being full, or a wrong token on older firmware'
+  : '';
+
+// ---- the token ----
+export function saveToken(v) {
+  if (v.length < 8) { say('The token is 8–16 characters.'); return false; }
+  // the selected board gets it; it also becomes the shared default when
+  // there is none yet (first run) — the token boards without their own try
+  if (S.device) { receivers[S.device.id].token = v; saveReceivers(); }
+  if (!S.device || !store.get('ble-token')) store.set('ble-token', v);
+  S.editToken = false;
+  say('');
+  resume();
+  return true;
+}
+export function editToken(on) { S.editToken = on; say(''); }
+
+export async function forget() {
+  if (S.busy || !S.device) return;
+  const d = S.device;
+  clearTimeout(retryTimer);
+  watchAbort?.abort();
+  if (d.gatt.connected) d.gatt.disconnect();
+  S.device = null; S.ctrl = S.stat = null; S.psu = -1; S.editToken = false;
+  dashReset();
+  delete receivers[d.id];
+  known.delete(d.id);
+  saveReceivers();
+  if (store.get('ble-current') === d.id) store.set('ble-current', '');
+  try { await d.forget?.(); } catch {} // Chrome ≥110 revokes the grant too
+  say('');
+  resume(); // falls over to the next known board, if any
+}
+
+// ---- the dashboard's data ----
+// A fan is an input read through a curve onto an output (daemon/fans.hpp).
+// Its input: the config's string ("fallback", "gpio:0", "esp32_temp", "temp",
+// "amdgpu:edge", "nct6686:pwm1", "cpu_load", "gpu_load") → its kind and parts
+export const SRC_KINDS = {
+  fallback: { label: 'Fixed speed', hint: 'runs at the fallback speed, always' },
+  gpio:     { label: 'PWM input', hint: 'a fan wire on a receiver pin' },
+  esp32_temp: { label: 'Receiver temperature', hint: 'the temperature of the receiver’s own chip' },
+  temp:     { label: 'CPU temperature' },
+  hwmon:    { label: 'Sensor', hint: 'chip:label, e.g. amdgpu:edge, pmbus:GPU VRM or smu:VRAM hotspot' },
+  pwm:      { label: 'Host fan header', hint: 'chip:pwmN, e.g. nct6686:pwm1' },
+  cpu_load: { label: 'CPU load' },
+  gpu_load: { label: 'GPU load' },
+  host:     { label: 'Host curve', hint: 'an input only the host reads' },
+};
+export const HOST_KINDS = ['temp', 'hwmon', 'pwm', 'cpu_load', 'gpu_load']; // the daemon runs these
+export const FILE_PREFIX = 'file:'; // hwmon.hpp: a spec naming a file holding one temperature
+export function srcInfo(s) {
+  s = String(s || '');
+  if (s === 'fallback' || s === 'constant') return { kind: 'fallback', src: 'fallback' };
+  if (s === 'temp' || s === 'cpu_load' || s === 'gpu_load' || s === 'esp32_temp') return { kind: s, src: s };
+  const i = s.indexOf(':'), chip = i < 0 ? s : s.slice(0, i), lbl = i < 0 ? '' : s.slice(i + 1);
+  if (chip === 'gpio') return { kind: 'gpio', src: s, gpio: parseInt(lbl, 10) };
+  if (/^pwm\d+$/.test(lbl)) return { kind: 'pwm', src: s, spec: s };
+  return { kind: 'hwmon', src: s, spec: s };
+}
+// the config string a working copy's input stands for
+export const srcText = h => h.kind === 'gpio' ? `gpio:${h.gpio}`
+  : (h.kind === 'hwmon' || h.kind === 'pwm') ? (h.spec || '') : h.kind;
+// its output: "" (parked), "headerN", "gpio:N", "chip:pwmN" (a host output)
+export function outInfo(o) {
+  o = String(o || '');
+  if (!o) return { kind: 'parked' };
+  let m = /^header([1-9]\d*)$/.exec(o);
+  if (m) return { kind: 'header', num: +m[1] };
+  m = /^gpio:(0|[1-9]\d*)$/.exec(o);
+  if (m) return { kind: 'gpio', num: +m[1] };
+  return { kind: 'host', spec: o };
+}
+export const isReceiverOut = o => o.kind === 'header' || o.kind === 'gpio';
+// the GPIO a receiver output drives, through the receiver's header map (null
+// = not a receiver output, or a header the map doesn't know)
+export function outPin(o) {
+  if (o.kind === 'gpio') return o.num;
+  const hp = S.info && S.info.headerPins;
+  return o.kind === 'header' && hp && hp[o.num - 1] != null ? hp[o.num - 1] : null;
+}
+export const outLabel = o => o.kind === 'header' ? `Header ${o.num}` : o.kind === 'gpio' ? `GPIO${o.num}`
+  : o.kind === 'host' ? o.spec.replace(':', ' ') : 'No output';
+export const isFixed = h => h.kind === 'fallback'; // no curve
+// a parked fan following a host header: it only shows what the board runs
+// there (curve, fallback and boost do nothing until it has an output)
+export const watchOnly = h => h.out.kind === 'parked' && h.kind === 'pwm';
+export const isTempX = h => h.kind === 'temp' || h.kind === 'hwmon' || h.kind === 'esp32_temp'; // the curve's x is °C
+export const TEMP_MAX = 200; // °C, the daemon's hwmon::TEMP_MAX: no reading goes above it
+// the receiver runs this fan's curve itself (fanwire::Header::ownCurve): its
+// points travel as bytes, so x is a whole number 0..100 (percent or °C)
+export const ownCurve = h => h.kind === 'gpio' || h.kind === 'esp32_temp';
+export const xMax = h => ownCurve(h) ? 100 : isTempX(h) ? TEMP_MAX : 100;
+export const xStep = h => ownCurve(h) || !isTempX(h) ? 1 : 0.5;
+export const NONE = 0xFF;
+export const CHANNELS = 6, MAX_POINTS = 8; // common/fancurve.hpp: the daemon and the receiver cap at this too
+export const SRC_NAMES = ['', 'fallback', 'live', 'boost', 'curve']; // fan::SRC_* (curve = the receiver's own curve)
+const KIND_BYTE = { fallback: 0, gpio: 1, host: 2, esp32_temp: 3 }; // protocol.hpp FAN_KIND_*
+const KIND_NAME = Object.fromEntries(Object.entries(KIND_BYTE).map(([k, v]) => [v, k]));
+const OUT_HEADER = 1, OUT_GPIO = 2;                  // protocol.hpp FAN_OUT_*
+// the fans view's length by layout version: 1 = state(1) duty(1) per slot,
+// 2 adds the receiver's stored fallback(1), 3 the input kind(1) and input(1).
+// A ver-3 view may carry a tail after the uptime: the chip's temperature,
+// int16 tenths of °C (-32768 = none) — `temp`, null without it
+const FANS_STRIDE = { 1: 2, 2: 3, 3: 5 };
+export const FANS_LEN = ver => 4 + CHANNELS * FANS_STRIDE[ver] + 4;
+const TEMP_NONE = -32768;
+// the standalone value: protocol.hpp CMD_FAN_STANDALONE's layout — one record
+// per slot (common/fanwire.hpp): fallback boost boost_secs ramp kind gpio npts
+// pts[8][2] out_kind out
+export const SA_HEADER_LEN = 9 + 2 * MAX_POINTS;
+export const SA_LEN = CHANNELS * SA_HEADER_LEN;
+// what a fan runs when its config says nothing (protocol.hpp FAN_DEFAULT_*,
+// fans.hpp DEFAULT_HYSTERESIS): the daemon's JSON leaves a tuning out at its default
+export const DEFAULTS = { hyst: 3, ramp: 5, boostSecs: 5 };
+export const NAME_CHARS = 16; // fans.hpp NAME_CHARS
+const SAVE_TIMEOUT_MS = 6000;
+const utf8 = new TextDecoder();
+const u32 = (dv, o) => dv.getUint32(o, true);
+
+export function parseFans(dv) {
+  if (dv.byteLength < 1) return null;
+  const ver = dv.getUint8(0), stride = FANS_STRIDE[ver] || 0;
+  if (!stride || dv.byteLength < FANS_LEN(ver)) return null;
+  const f = dv.getUint8(1);
+  const out = {
+    active: !!(f & 1), boosting: !!(f & 2), hold: !!(f & 4), live: !!(f & 8),
+    host: !!(f & 16), telem: !!(f & 32),
+    psu: dv.getUint8(2), age: dv.getUint8(3), h: [], uptime: u32(dv, 4 + CHANNELS * stride), temp: null,
+  };
+  if (dv.byteLength >= FANS_LEN(ver) + 2) {
+    const t = dv.getInt16(FANS_LEN(ver), true);
+    if (t !== TEMP_NONE) out.temp = t / 10;
+  }
+  for (let i = 0; i < CHANNELS; i++) {
+    const o = 4 + i * stride, st = dv.getUint8(o);
+    out.h.push({ wired: !!(st & 1), src: (st >> 1) & 7, duty: dv.getUint8(o + 1),
+                 fb: stride >= 3 ? dv.getUint8(o + 2) : null,   // null: firmware before the slider
+                 kind: stride >= 5 ? dv.getUint8(o + 3) : null, // null: firmware before gpio inputs
+                 in: stride >= 5 ? dv.getUint8(o + 4) : NONE });
+  }
+  return out;
+}
+
+// one slot's record → { used, out, fb, boost, boostSecs, ramp, kind, gpio, pts }
+function decodeRecord(dv, q) {
+  const k = dv.getUint8(q + 4), n = Math.min(MAX_POINTS, dv.getUint8(q + 6));
+  const ok = dv.getUint8(q + 7 + 2 * MAX_POINTS), on = dv.getUint8(q + 8 + 2 * MAX_POINTS);
+  const pts = [];
+  if (k === KIND_BYTE.gpio || k === KIND_BYTE.esp32_temp) for (let j = 0; j < n; j++) pts.push({ x: dv.getUint8(q + 7 + 2 * j), y: dv.getUint8(q + 8 + 2 * j) });
+  return { used: ok === OUT_HEADER || ok === OUT_GPIO,
+           out: ok === OUT_HEADER ? { kind: 'header', num: on } : ok === OUT_GPIO ? { kind: 'gpio', num: on } : { kind: 'parked' },
+           fb: dv.getUint8(q), boost: dv.getUint8(q + 1), boostSecs: dv.getUint8(q + 2), ramp: dv.getUint8(q + 3),
+           kind: KIND_NAME[k] ?? 'host', gpio: dv.getUint8(q + 5), pts };
+}
+// ...and a card's fan → the record the receiver stores (the control op's
+// argument); null = an unused slot (the fan removed)
+export function encodeRecord(h) {
+  const r = new Uint8Array(SA_HEADER_LEN).fill(NONE);
+  if (!h) return r;
+  const gpio = h.kind === 'gpio', own = ownCurve(h);
+  r.set([h.fallback, h.boost === NONE || h.boost === null || h.boost === undefined ? NONE : h.boost,
+         Math.round(h.boostSecs ?? DEFAULTS.boostSecs), Math.round(h.ramp ?? DEFAULTS.ramp),
+         KIND_BYTE[h.kind] ?? KIND_BYTE.host, gpio ? h.gpio : NONE, own ? h.pts.length : 0]);
+  for (let j = 0; j < MAX_POINTS; j++) r.set(own && j < h.pts.length ? [h.pts[j].x, h.pts[j].y] : [0, 0], 7 + 2 * j);
+  r.set([h.out.kind === 'header' ? OUT_HEADER : OUT_GPIO, h.out.num], 7 + 2 * MAX_POINTS);
+  return r;
+}
+
+// the receiver's standalone settings → { h[slot]: decodeRecord }
+export function parseSa(dv) {
+  if (dv.byteLength < SA_LEN) return null;
+  const out = { h: [] };
+  for (let i = 0; i < CHANNELS; i++) out.h.push(decodeRecord(dv, i * SA_HEADER_LEN));
+  return out;
+}
+
+// the fan cards, in the order the page shows them: the daemon's list when it
+// has one (key 'f<index>', route 'daemon' — edits go into the config file
+// and the daemon pushes the receiver), else the receiver's own fans (key
+// 's<slot>', route 'receiver' — stored on the receiver until a daemon next
+// connects and the config wins again). A receiver-output fan carries its
+// slot: the daemon gives the slots out in list order, as the receiver holds them
+export function cards() {
+  if (S.cfg) {
+    let slot = 0;
+    return S.cfg.fans.map((f, i) => ({ ...f, key: 'f' + i, index: i, route: 'daemon',
+                                       slot: isReceiverOut(f.out) ? slot++ : -1 }));
+  }
+  if (!S.sa) return [];
+  return S.sa.h.map((s, i) => s.used ? { ...receiverFan(s, i), key: 's' + i, index: -1, route: 'receiver', slot: i } : null)
+               .filter(Boolean);
+}
+// a receiver slot as a fan (no daemon to name it)
+function receiverFan(s, slot) {
+  const f = S.fans && S.fans.h[slot];
+  return { name: outLabel(s.out), output: s.out.kind === 'header' ? `header${s.out.num}` : `gpio:${s.out.num}`, out: s.out,
+           kind: s.kind, src: s.kind === 'gpio' ? `gpio:${s.gpio}` : s.kind, gpio: s.gpio, spec: '',
+           pts: s.pts.map(p => ({ ...p })), boost: s.boost, boostSecs: s.boostSecs, ramp: s.ramp, hyst: DEFAULTS.hyst,
+           fallback: f && f.fb !== null && f.fb !== NONE ? f.fb : s.fb };
+}
+export const cardOf = key => cards().find(c => c.key === key) || null;
+// a fan to start the "add a fan" editor from: the first header no fan has,
+// else no output; a fixed speed
+export function newFan() {
+  const route = S.cfg ? 'daemon' : 'receiver';
+  const used = new Set(cards().map(c => c.output));
+  const hdr = headerList().find(n => !used.has(`header${n}`));
+  const output = hdr ? `header${hdr}` : route === 'daemon' ? '' : null;
+  if (output === null) return null; // the receiver alone, every header taken
+  const slot = route === 'daemon' ? -1 : S.sa ? S.sa.h.findIndex(s => !s.used) : -1;
+  if (route === 'receiver' && slot < 0) return null;
+  return { key: 'new', index: -1, route, slot, name: '', output, out: outInfo(output), kind: 'fallback', src: 'fallback',
+           gpio: 0, spec: '', pts: [], boost: NONE, boostSecs: DEFAULTS.boostSecs, ramp: DEFAULTS.ramp,
+           hyst: DEFAULTS.hyst, fallback: 100 };
+}
+// the board's headers by number (info ver 3), else 1..4 on a receiver that
+// doesn't say
+export function headerList() {
+  const hp = S.info && S.info.headerPins;
+  if (!hp) return [1, 2, 3, 4];
+  const out = [];
+  hp.forEach((g, i) => { if (g !== null) out.push(i + 1); });
+  return out;
+}
+
+// the receiver's live view of a card (its slot), or null
+export const liveOf = c => c && c.slot >= 0 && S.fans ? S.fans.h[c.slot] : null;
+// the daemon's telemetry for a card (by list index), or null
+export const telemOf = c => c && c.index >= 0 && S.fans && S.fans.telem && S.telem ? S.telem.fans[c.index] || null : null;
+// the reading a card's curve sees right now: a gpio input's from the
+// receiver (it samples the pin), the receiver's temperature from its own
+// view, a host input's from the daemon's telemetry
+export function inputOf(c) {
+  if (!c) return null;
+  if (c.kind === 'gpio') { const f = liveOf(c); return f && f.in !== NONE ? f.in : null; }
+  if (c.kind === 'esp32_temp') return S.fans ? S.fans.temp : null;
+  const t = telemOf(c);
+  return t && t.in !== undefined ? t.in : null;
+}
+// what a kind reads right now, for the input list: null when nothing does
+export function readingOf(kind, c) {
+  const t = S.fans && S.fans.telem && S.telem;
+  if (kind === 'temp') return t && t.temp !== undefined ? t.temp : null;
+  if (kind === 'cpu_load') return t && t.cpu !== undefined ? t.cpu : null;
+  if (kind === 'gpu_load') return t && t.gpu !== undefined ? t.gpu : null;
+  if (kind === 'gpio') { const f = liveOf(c); return f && f.kind === KIND_BYTE.gpio && f.in !== NONE ? f.in : null; }
+  if (kind === 'esp32_temp') return S.fans ? S.fans.temp : null;
+  return null;
+}
+// the rpm a host pwm output's tachometer reads ("nct6686:pwm2"), null with none
+export function rpmOf(spec) {
+  const o = S.outs && S.outs.find(x => x.spec === spec);
+  return o ? o.rpm : null;
+}
+// a catalogue entry's reading by its spec ("amdgpu:edge", "nct6686:pwm1" —
+// a host output's duty), null when not listed
+export function sensorReading(spec) {
+  const e = S.sens && S.sens.find(x => x.spec === spec);
+  if (e) return e.value;
+  const o = S.outs && S.outs.find(x => x.spec === spec);
+  return o ? o.duty : null;
+}
+
+// the daemon's sensor catalogue (fans.hpp sensorsJson): chips → labelled
+// temperatures. "_outs" lists the host's pwm outputs (S.outs), each one an
+// output a fan could drive and an input a fan could follow. "_more" counts
+// what did not fit (S.sensMore); it can still be typed
+export function parseSensors(text) {
+  let j;
+  try { j = JSON.parse(text); } catch { return null; }
+  if (!j || typeof j !== 'object') return null;
+  const out = [];
+  S.sensMore = typeof j._more === 'number' ? j._more : 0;
+  S.outs = Array.isArray(j._outs) ? j._outs.filter(o => Array.isArray(o) && typeof o[0] === 'string')
+    .map(([spec, duty, rpm, w]) => ({ spec, duty: +duty, rpm: rpm >= 0 ? +rpm : null, writable: !!w })) : null;
+  for (const chip of Object.keys(j)) {
+    if (chip === '_outs' || chip === '_more') continue;
+    const g = j[chip];
+    if (!g || typeof g !== 'object') continue;
+    for (const k of Object.keys(g)) // a file entry's key is its path
+      out.push({ spec: `${chip}:${k}`, chip, label: chip === 'file' ? k.split('/').pop() : k, value: +g[k] });
+  }
+  return out;
+}
+
+// "45:35 60:55" -> [{x, y}], sorted; the daemon's notation
+export function parseCurve(text) {
+  const toks = String(text || '').trim().split(/[\s,]+/).filter(Boolean);
+  return toks.map(t => { const [x, y] = t.split(':').map(parseFloat); return { x, y }; })
+             .filter(p => !isNaN(p.x) && !isNaN(p.y)).sort((a, b) => a.x - b.x);
+}
+export const curveText = pts => pts.map(p => `${p.x}:${p.y}`).join(' ');
+
+// the daemon's config JSON -> { editable, rev, err, fans: [fan] }; a fan's
+// tunings (h/r/t) are absent at their defaults or where they don't apply
+export function parseCfg(text) {
+  let j;
+  try { j = JSON.parse(text); } catch { return null; }
+  if (!j || typeof j !== 'object' || !Array.isArray(j.fans)) return null;
+  return { editable: !!j.editable, rev: String(j.rev || ''), err: typeof j.err === 'string' ? j.err : '',
+           fans: j.fans.map(h => {
+             const output = String(h.o ?? ''), s = srcInfo(h.i);
+             return { name: String(h.n || ''), output, out: outInfo(output), ...s, pts: isFixed(s) ? [] : parseCurve(h.c),
+                      boost: h.b === null || h.b === undefined ? NONE : +h.b,
+                      fallback: h.f === undefined ? 100 : +h.f,
+                      hyst: h.h === undefined ? DEFAULTS.hyst : +h.h, ramp: h.r === undefined ? DEFAULTS.ramp : +h.r,
+                      boostSecs: h.t === undefined ? DEFAULTS.boostSecs : +h.t };
+           }) };
+}
+// which settings a fan has (fans.hpp TUNINGS, and the boost's rule): the
+// editor shows these, the daemon refuses the others
+export const hasHyst = h => h.kind === 'temp' || h.kind === 'hwmon'; // a temperature the host reads (the receiver smooths its own)
+export const hasRamp = h => !isFixed(h) && !watchOnly(h);                // an input with a curve
+export const hasBoost = h => h.out.kind !== 'host' && !watchOnly(h);     // the receiver runs a boost, before the host is up
+export const hasBoostSecs = h => hasBoost(h) && h.boost !== NONE; // a fan with a boost
+
+// the daemon's telemetry JSON -> { temp, cpu, gpu, vrm, fans[index]: { in, duty, st } | null };
+// vrm (the host's VRM controller) is { vin, cpu: { v, a, t }, gpu: { v, a, t } } or null
+export function parseTelem(text) {
+  let j;
+  try { j = JSON.parse(text); } catch { return null; }
+  if (!j || typeof j !== 'object') return null;
+  const vrm = j.vrm && typeof j.vrm === 'object' ? j.vrm : null;
+  return { temp: j.temp, cpu: j.cpu, gpu: j.gpu, vrm, fans: Array.isArray(j.fans) ? j.fans : [] };
+}
+
+// ver 1: version, heap. ver 2 adds the GPIOs a gpio:N input may read as a
+// 64-bit mask (bit N = GPIO N) — `pins` is that as a sorted list, or null on
+// firmware that doesn't say (the editor then asks for a number); ver 3 the
+// board's header map (`headerPins`, header n's GPIO at [n-1], null = none)
+// and the GPIOs a gpio:N output may drive (`outPins`). A ver-3 receiver is
+// also one that serves the page characteristic and the 25-byte fan record
+const mask64 = (dv, o) => { const out = []; for (let g = 0; g < 64; g++) if (dv.getUint8(o + (g >> 3)) >> (g & 7) & 1) out.push(g); return out; };
+export function parseInfo(dv) {
+  const ver = dv.byteLength ? dv.getUint8(0) : 0;
+  if (dv.byteLength < 41 || ver < 1 || ver > 3) return null;
+  let v = '';
+  for (let k = 1; k < 33; k++) { const ch = dv.getUint8(k); if (!ch) break; v += String.fromCharCode(ch); }
+  const pins = ver >= 2 && dv.byteLength >= 49 ? mask64(dv, 41) : null;
+  let headerPins = null, outPins = null;
+  if (ver >= 3 && dv.byteLength >= 49 + CHANNELS + 8) {
+    headerPins = [];
+    for (let i = 0; i < CHANNELS; i++) { const g = dv.getUint8(49 + i); headerPins.push(g === NONE ? null : g); }
+    outPins = mask64(dv, 49 + CHANNELS);
+  }
+  return { ver, version: v, heap: u32(dv, 33), minHeap: u32(dv, 37), pins, headerPins, outPins };
+}
+
+// ---- the power switch ----
+// the receiver's view (ble.cpp buildPwr): ver(1) flags(1) psu(1) senseMv(2)
+// then the four tunings as CMD_PWR_TUNING lays them out, then six pins
+export const PWR_LEN = 3 + 2 + 8 + 6;
+export const PIN_KEYS = ['ps_on', 'button', 'button_gnd', 'sense', 'led', 'wake']; // the config's names, wire order
+export function parsePwr(dv) {
+  if (dv.byteLength < PWR_LEN || dv.getUint8(0) !== 1) return null;
+  const f = dv.getUint8(1), mv = dv.getUint16(3, true);
+  const pins = {};
+  PIN_KEYS.forEach((k, i) => { const g = dv.getUint8(13 + i); pins[k] = g === 0xFF ? null : g; });
+  return { active: !!(f & 1), sense: !!(f & 2), psu: dv.getUint8(2), mv: mv === 0xFFFF ? null : mv,
+           hold: dv.getUint16(5, true), boot: dv.getUint16(7, true),
+           low: dv.getUint16(9, true), high: dv.getUint16(11, true), pins };
+}
+
+// the daemon's view (daemon/power_remote.hpp), keys as the config spells
+// them. `wake` is the config's pins.wake (a GPIO or null); undefined when the
+// daemon doesn't say — one from before the key, or a config whose value it
+// couldn't use — and the pin is then the receiver's business alone
+export function parsePwrCfg(text) {
+  let j;
+  try { j = JSON.parse(text); } catch { return null; }
+  if (!j || typeof j !== 'object' || j.present === false) return null; // no block: the daemon has no say
+  return { editable: !!j.editable, hold: +j.hold_seconds || 2, boot: +j.boot_timeout_seconds || 10,
+           low: +j.sense_low_mv || 0, high: +j.sense_high_mv || 0,
+           wake: !('wake' in j) ? undefined : j.wake === null ? null : Number.isInteger(j.wake) ? j.wake : undefined,
+           shortPress: typeof j.short_press === 'string' && j.short_press ? j.short_press : null };
+}
+
+// where a power edit goes. 'daemon' while the host is up with a daemon
+// that has the block (the edit lands in the config and the daemon pushes the
+// receiver); 'readonly' when that daemon can't write its config; 'receiver'
+// otherwise — the host off, or no daemon at all: the control op stores the
+// tunings on the receiver until a daemon next connects and the config wins
+// again (short_press is the daemon's alone, so it can't be edited that way).
+export function powerRoute() {
+  const hostUp = S.fans ? S.fans.host : S.psu === 2;
+  if (S.pcfg && hostUp) return S.pcfg.editable ? 'daemon' : 'readonly';
+  return 'receiver';
+}
+// where the wake pin's edit goes: the daemon's route when the daemon speaks
+// the key (it writes pins.wake into the config and pushes the receiver),
+// the receiver alone otherwise — a daemon from before the key never pushes
+// a wake pin, so a pick stored on the receiver is safe from it
+export function wakeRoute() {
+  const r = powerRoute();
+  if (r !== 'receiver' && S.pcfg && S.pcfg.wake !== undefined) return r;
+  return 'receiver';
+}
+// the settings an editor starts from: the daemon's view when it decides,
+// else what the receiver runs — in seconds and millivolts either way; the
+// wake pin by its own route (wakeRoute), a GPIO or null
+export function powerTuning() {
+  const r = powerRoute();
+  const wake = wakeRoute() !== 'receiver' ? S.pcfg.wake : S.pwr ? S.pwr.pins.wake : null;
+  if (r !== 'receiver' && S.pcfg) return { hold: S.pcfg.hold, boot: S.pcfg.boot, low: S.pcfg.low, high: S.pcfg.high, wake, shortPress: S.pcfg.shortPress };
+  if (S.pwr) return { hold: S.pwr.hold / 1000, boot: S.pwr.boot / 1000, low: S.pwr.low, high: S.pwr.high, wake, shortPress: S.pcfg ? S.pcfg.shortPress : null };
+  return null;
+}
+// the pins the wake input may be moved to: the receiver's free input pins
+// (parseInfo) with the pin in force kept in the list, less the pins fan
+// headers read their PWM on (the receiver refuses those). null when the
+// receiver doesn't list its pins (firmware before the info's ver 2)
+export function wakePinOptions(current) {
+  const pins = S.info && S.info.pins;
+  if (!pins) return null;
+  const taken = new Set(S.sa ? S.sa.h.filter(h => h.used && h.kind === 'gpio' && h.gpio !== NONE).map(h => h.gpio) : []);
+  const opts = pins.filter(g => !taken.has(g));
+  if (current !== null && current !== undefined && !opts.includes(current)) opts.push(current);
+  return opts.sort((a, b) => a - b);
+}
+
+function dashReset() {
+  S.fansChr = S.saChr = S.pwrChr = S.infoChr = S.pageChr = S.viewsChr = null;
+  S.fans = S.sa = S.cfg = S.telem = S.info = S.sens = S.outs = S.pwr = S.pcfg = S.steam = S.lib = null; S.sensMore = 0;
+  S.saving = null; S.note = null;
+  clearTimeout(saveTimer);
+  stripReset();
+}
+
+// the status line the page shows under its header — one for the whole page,
+// whatever is saving: 'ok' ones clear themselves, an error stays until the
+// next one, a tap on it, or the user moves on (dismiss)
+export function note(text, cls) {
+  S.note = text ? { text, cls: cls || '' } : null;
+  emit();
+  if (cls === 'ok') setTimeout(() => { if (S.note?.text === text) { S.note = null; emit(); } }, 2500);
+}
+export function dismiss() { if (S.note && S.note.cls === 'err') { S.note = null; emit(); } }
+
+// A view's notification carries as much of it as the ATT MTU leaves room
+// for, with the whole view's length up front: one that arrived whole is used
+// as it is, one cut short is read whole through the page characteristic —
+// one read at a time per view, notifications landing meanwhile mark it stale
+// so it runs once more. The receiver's binary values (fans, standalone, pwr)
+// are read again by plain reads when a notification comes up short.
+const PAGE_HDR = 6; // ver view page pages len(2)
+// one whole view, page by page: page 0 makes the receiver take a snapshot,
+// every later page is served from the same one, so the pages always belong
+// together (ble.cpp pageAccess) — as long as no other paged read's page 0
+// lands in between, which would re-snapshot under this one. Each GATT op is
+// queued on its own, so the whole read is held behind its own chain: paged
+// reads run one at a time.
+let pagedChain = Promise.resolve();
+export function readPaged(view, d = S.device) {
+  const p = pagedChain.then(() => { if (S.device !== d) throw SUPERSEDED; return readPagedNow(view); });
+  pagedChain = p.then(() => {}, () => {});
+  return p;
+}
+async function readPagedNow(view) {
+  const chr = S.pageChr, parts = [];
+  let pages = 1, total = 0, have = 0;
+  for (let p = 0; p < pages; p++) {
+    await gattWrite(chr, Uint8Array.of(view, p));
+    const v = await gattRead(chr);
+    if (v.byteLength < PAGE_HDR || v.getUint8(0) !== 1 || v.getUint8(1) !== view || v.getUint8(2) !== p)
+      throw new Error('the receiver answered a different page');
+    if (p === 0) { pages = Math.max(1, v.getUint8(3)); total = v.getUint16(4, true); }
+    const part = new Uint8Array(v.buffer, v.byteOffset + PAGE_HDR, v.byteLength - PAGE_HDR);
+    parts.push(part); have += part.length;
+  }
+  if (have !== total) throw new Error('a paged value came back short');
+  const out = new Uint8Array(total);
+  let at = 0;
+  for (const part of parts) { out.set(part, at); at += part.length; }
+  return new DataView(out.buffer);
+}
+// a receiver value whose notification came up short is read again
+function notifier(current, ok, apply) {
+  let reading = false, stale = false;
+  return async e => {
+    const chr = e.target;
+    if (chr !== current()) return;
+    const dv = chr.value;
+    if (ok(dv)) { apply(dv); return; }
+    if (reading) { stale = true; return; }
+    reading = true;
+    try {
+      do {
+        stale = false;
+        const v = await gattRead(chr);
+        if (chr !== current()) return;
+        apply(v);
+      } while (stale);
+    } catch {} finally { reading = false; }
+  };
+}
+const onFansEvent = e => {
+  if (e.target !== S.fansChr) return;
+  const f = parseFans(e.target.value);
+  if (f) { S.fans = f; emit(); }
+};
+const onSaEvent = notifier(() => S.saChr, dv => dv.byteLength >= SA_LEN, onSa);
+const onPwrEvent = notifier(() => S.pwrChr, dv => dv.byteLength >= PWR_LEN, dv => {
+  const v = parsePwr(dv);
+  if (!v) return;
+  const moved = S.pwr && S.pwr.pins.wake !== v.pins.wake; // changes the free-pin lists
+  S.pwr = v; emit();
+  if (moved) refreshInfo();
+});
+
+// what each daemon view's arrival does (an empty one: the daemon has nothing
+// there, or there is no daemon); a view this page doesn't know is passed over
+const json = dv => dv.byteLength ? utf8.decode(dv) : null;
+const VIEW_APPLY = {
+  [VIEW.fancfg]: onCfg,
+  [VIEW.telem]: dv => { const t = json(dv); S.telem = t === null ? null : parseTelem(t); emit(); },
+  [VIEW.strip]: dv => onStripCfg(dv),
+  [VIEW.sensors]: dv => { const t = json(dv); S.sens = t === null ? null : parseSensors(t); emit(); },
+  [VIEW.power]: dv => onPcfg(dv),
+  [VIEW.steam]: dv => onSteam(dv),
+  [VIEW.library]: dv => onLibrary(dv),
+};
+// one view, whole, through the page characteristic
+async function readView(view) {
+  const d = S.device;
+  const v = await readPaged(view, d);
+  if (S.device === d) VIEW_APPLY[view](v);
+}
+const viewReads = new Map(); // view -> { stale } while a paged re-read runs
+async function onViewsEvent(e) {
+  if (e.target !== S.viewsChr) return;
+  const dv = e.target.value;
+  if (dv.byteLength < 3) return;
+  const view = dv.getUint8(0), total = dv.getUint16(1, true);
+  if (!VIEW_APPLY[view]) return;
+  if (dv.byteLength - 3 === total) { VIEW_APPLY[view](new DataView(dv.buffer, dv.byteOffset + 3, total)); return; }
+  const r = viewReads.get(view);
+  if (r) { r.stale = true; return; }
+  const run = { stale: false };
+  viewReads.set(view, run);
+  const d = S.device;
+  try {
+    do { run.stale = false; await readView(view); } while (run.stale && S.device === d);
+  } catch {} finally { viewReads.delete(view); } // unread: the next notification tries again
+}
+
+// re-read the receiver's build facts — its free input and output pins,
+// after the wake pin or a fan's output moved (the info value is read-only and
+// never notifies)
+async function refreshInfo() {
+  const chr = S.infoChr;
+  if (!chr) return;
+  try { const v = parseInfo(await gattRead(chr)); if (chr === S.infoChr && v) { S.info = v; emit(); } } catch {}
+}
+// an answer landed for the save in flight: that edit is done
+function settled(key) {
+  S.saving = null;
+  clearTimeout(saveTimer);
+  note('saved', 'ok');
+  onSaved?.(key);
+}
+const fanSaving = () => S.saving !== null && S.saving !== 'p'; // a fan save (a card's key) is waiting
+
+export function onCfg(dv) {
+  S.cfg = dv.byteLength ? parseCfg(utf8.decode(dv)) : null;
+  if (fanSaving()) {
+    // the daemon answers every edit with its config: with "err" when it
+    // refused (the list as it was, and why), without when it took it
+    if (S.cfg && S.cfg.err) { S.saving = null; clearTimeout(saveTimer); note(S.cfg.err, 'err'); }
+    // no list at all: the host has no fans block (any more) — the edit went
+    // nowhere, and the cards are the receiver's own now
+    else if (!S.cfg) { S.saving = null; clearTimeout(saveTimer); note('the host has no fan list — the receiver runs the fans; edit again', 'err'); }
+    else settled(S.saving);
+  }
+  emit();
+}
+
+// the receiver's standalone settings (also the echo of a standalone save);
+// a fan's output moving changes the receiver's free pins, so its info is read again
+export function onSa(dv) {
+  const s = parseSa(dv);
+  if (!s) return;
+  S.sa = s;
+  if (fanSaving() && !S.cfg) settled(S.saving);
+  emit();
+  refreshInfo();
+}
+
+// the daemon's power switch view (also the answer to a routed power save)
+export function onPcfg(dv) {
+  S.pcfg = dv.byteLength ? parsePwrCfg(utf8.decode(dv)) : null;
+  if (S.saving === 'p' && S.pcfg) settled('p');
+  emit();
+}
+// the UI's hook: a save landed, close that editor
+let onSaved = null;
+export const whenSaved = fn => { onSaved = fn; };
+
+// does this receiver speak the daemon's views? A receiver on older firmware —
+// and the daemon that matches it — still powers the host, but the dashboard
+// needs both updated
+export const fansCurrent = () => !!S.viewsChr;
+
+// the dashboard of the board open() just connected; a switch while it
+// loads stops it (SUPERSEDED, out of the first GATT op after), and an
+// optional value that failed to read is null — unless that failure was the
+// switch, which must not blank the next board's values
+const skip = e => { if (e === SUPERSEDED) throw e; return null; };
+async function dashOpen(svc) {
+  const d = S.device;
+  let f;
+  try { f = await svc.getCharacteristic(FANS); } catch { return; } // no dashboard, and nothing to say
+  S.fansChr = f;
+  let i, s, pw, pg, v;
+  try {
+    i = await svc.getCharacteristic(INFO);
+    s = await svc.getCharacteristic(FANSA);
+    pw = await svc.getCharacteristic(PWR);
+    pg = await svc.getCharacteristic(PAGE);
+    v = await svc.getCharacteristic(VIEWS);
+  } catch { emit(); return; } // firmware from before the views: the screens say to update
+  if (S.device !== d || !d.gatt.connected) return;
+  S.saChr = s; S.pwrChr = pw; S.infoChr = i; S.pageChr = pg; S.viewsChr = v;
+  f.addEventListener('characteristicvaluechanged', onFansEvent);
+  s.addEventListener('characteristicvaluechanged', onSaEvent);
+  pw.addEventListener('characteristicvaluechanged', onPwrEvent);
+  v.addEventListener('characteristicvaluechanged', onViewsEvent);
+  // Every GATT op is one round trip, one at a time, so the order is what the
+  // screen fills in by: the header's readings and the fan list first, then
+  // the Power tab's, the rest of the fans' facts, the strip, and last the
+  // sensor catalogue — the biggest view, and only the input picker's. The
+  // views are subscribed before any is read, so no change is missed — and
+  // the subscription is what tells the daemon to start reporting.
+  await gattSubscribe(f);
+  const fv = parseFans(await gattRead(f));
+  if (fv) S.fans = fv;
+  await gattSubscribe(v);
+  for (const id of [VIEW.telem, VIEW.fancfg]) await readView(id);
+  try { await gattSubscribe(pw); S.pwr = parsePwr(await gattRead(pw)); } catch (e) { S.pwr = skip(e); }
+  try { await readView(VIEW.power); } catch (e) { skip(e); }
+  try { S.info = parseInfo(await gattRead(i)); } catch (e) { S.info = skip(e); }
+  try { await gattSubscribe(s); onSa(await gattRead(s)); } catch (e) { skip(e); } // emits
+  emit();
+  for (const id of [VIEW.strip, VIEW.steam, VIEW.library, VIEW.sensors]) { try { await readView(id); } catch (e) { skip(e); } }
+}
+
+// ---- fan edits ----
+// what the daemon (or the receiver) will refuse, said here first (they also
+// validate). `key` is the card being edited ('new' for an added fan) — the
+// other cards are what an output may not collide with
+export function checkEdit(h, key) {
+  if (h.route === 'daemon') {
+    const nm = (h.name || '').trim();
+    if (!nm || [...nm].length > NAME_CHARS) return `a name is 1–${NAME_CHARS} characters`; // characters, as the daemon counts
+  }
+  if (h.route !== 'daemon' && !isReceiverOut(h.out)) return 'the receiver alone drives a header or a pin — pick one';
+  if (h.route !== 'daemon' && h.kind !== 'fallback' && !ownCurve(h)) return 'the receiver alone runs a fixed speed, a PWM input or its own temperature — pick one';
+  const other = cards().find(c => c.key !== key && h.output && c.output === h.output);
+  if (other) return `${outLabel(h.out)} is ${other.name || 'another fan'}’s output`;
+  // the same pin under two spellings (header1 and gpio:5 on a board wiring
+  // header 1 to GPIO5): the daemon can't see the header map, the receiver
+  // would drive only the first — so catch it here, where the map is known
+  const og = outPin(h.out), ig = h.kind === 'gpio' ? h.gpio : null;
+  if (og !== null && ig === og) return 'a pin can’t be the input and the output';
+  for (const c of cards()) {
+    if (c.key === key) continue;
+    const cg = outPin(c.out), who = c.name || 'another fan';
+    if (og !== null && cg === og) return `GPIO${og} is ${who}’s output (${outLabel(c.out)})`;
+    if (og !== null && c.kind === 'gpio' && c.gpio === og) return `GPIO${og} is ${who}’s PWM input`;
+    if (ig !== null && cg === ig) return `GPIO${ig} is ${who}’s output (${outLabel(c.out)})`;
+  }
+  if (h.out.kind === 'gpio' && !(Number.isInteger(h.out.num) && h.out.num >= 0 && h.out.num <= 48)) return 'the output pin is a number 0–48';
+  if (h.out.kind === 'host' && !/^[^:\s]+:pwm\d+$/.test(h.output)) return 'a host output is chip:pwmN, e.g. nct6686:pwm2';
+  if (h.kind === 'gpio' && h.out.kind === 'host') return 'a PWM input is read by the receiver, which can’t drive a host output';
+  if (h.kind === 'esp32_temp' && h.out.kind === 'host') return 'the receiver’s temperature is read by the receiver, which can’t drive a host output';
+  if (h.kind === 'pwm' && h.out.kind === 'host' && h.spec === h.output) return 'a host header can’t follow itself';
+  if (h.kind === 'gpio' && !(Number.isInteger(h.gpio) && h.gpio >= 0 && h.gpio <= 48)) return 'the pin is a number 0–48';
+  if (h.kind === 'gpio' && h.out.kind === 'gpio' && h.gpio === h.out.num) return 'a pin can’t be the input and the output';
+  if (h.kind === 'hwmon' && (h.spec || '').startsWith(FILE_PREFIX) && !/^\/\S/.test(h.spec.slice(FILE_PREFIX.length))) // the daemon insists on an absolute path
+    return 'a temperature file is its full path, e.g. /tmp/some_custom_temp_reading';
+  if ((h.kind === 'hwmon' || h.kind === 'pwm') && !/^[^:\s]+:\S[^:]*$/.test(h.spec || '')) // a label may hold spaces ("AMD TSI Addr 98h", "CPU VRM")
+    return h.kind === 'pwm' ? 'a host fan header is chip:pwmN, e.g. nct6686:pwm1' : 'a sensor is chip:label, e.g. amdgpu:edge';
+  if (h.kind === 'pwm' && !/:pwm\d+$/.test(h.spec)) return 'a host fan header is chip:pwmN, e.g. nct6686:pwm1';
+  if (!isFixed(h) && !watchOnly(h)) {
+    if (!h.pts.length) return 'a curve needs at least one point';
+    if (h.pts.length > MAX_POINTS) return `at most ${MAX_POINTS} points`;
+    const xs = new Set();
+    for (const p of h.pts) {
+      if (!(p.y >= 0 && p.y <= 100)) return 'speed must be 0–100 %';
+      if (!Number.isFinite(p.x)) return 'every point needs an input value';
+      if (h.kind === 'gpio' && !(Number.isInteger(p.x) && p.x >= 0 && p.x <= 100)) return 'a PWM input curve reads whole percents 0–100';
+      if (h.kind === 'esp32_temp' && !(Number.isInteger(p.x) && p.x >= 0 && p.x <= 100)) return 'a receiver temperature curve reads whole °C 0–100';
+      if (xs.has(p.x)) return `two points at ${p.x}`;
+      xs.add(p.x);
+    }
+  }
+  if (hasBoost(h) && h.boost !== NONE && !(h.boost >= 0 && h.boost <= 100)) return 'boost must be 0–100 % or blank';
+  if (hasHyst(h) && !(h.hyst >= 0)) return 'hysteresis is 0 °C or more';
+  if (hasRamp(h) && !(h.ramp >= 0 && h.ramp <= 255)) return 'the ramp is 0–255 % per second';
+  if (hasBoostSecs(h) && !(Number.isInteger(h.boostSecs) && h.boostSecs >= 0 && h.boostSecs <= 255)) return 'the boost runs 0–255 whole seconds';
+  if (!watchOnly(h) && !(h.fallback >= 0 && h.fallback <= 100)) return 'the fallback speed is 0–100 %';
+  return '';
+}
+
+// an edit of a daemon view, as the views characteristic takes it:
+// token(16) + view(1) + the edit's JSON. null when it can't go in one write
+function viewEdit(view, edit) {
+  const text = new TextEncoder().encode(JSON.stringify(edit));
+  const buf = new Uint8Array(TOKEN_LEN + 1 + text.length);
+  buf.set(tokenBytes()); buf[TOKEN_LEN] = view; buf.set(text, TOKEN_LEN + 1);
+  return buf.length > 512 ? null : buf;
+}
+
+// write one fan edit (the daemon's shapes, fans.hpp), then wait for the
+// daemon's view to come back (onCfg) — that is what "saved" or "refused"
+// means here. Resolves true once the write itself went through. `view` is
+// the daemon view edited: the fan list by default, the power switch for a
+// 'p' save (answered by onPcfg).
+export async function writeCfg(key, edit, view = VIEW.fancfg) {
+  if (!S.viewsChr || S.saving !== null) return false;
+  const buf = viewEdit(view, edit);
+  if (!buf) { note('that edit is too long to send — shorten the name or the input', 'err'); return false; }
+  S.saving = key;
+  note('saving…');
+  try {
+    await gattWrite(S.viewsChr, buf);
+    clearTimeout(saveTimer);
+    saveTimer = setTimeout(() => {
+      if (S.saving !== key) return;
+      S.saving = null;
+      note('no answer from the host', 'err');
+    }, SAVE_TIMEOUT_MS);
+    return true;
+  } catch (e) {
+    if (e === SUPERSEDED) return false; // the switch reset the save state already
+    S.saving = null;
+    if (tokenRejected(e)) { note('token rejected', 'err'); S.editToken = true; emit(); }
+    else note(`write failed: ${e.message}${writeHint(e)}`, 'err');
+    return false;
+  }
+}
+
+// a standalone fan's edit: its whole record (null: removed) straight to the
+// receiver's slot, which validates the pins and the curve itself (a refusal
+// comes back as a write error) and echoes the stored value on the standalone
+// characteristic
+async function writeRecord(slot, h, key) {
+  if (!S.ctrl || S.saving !== null) return;
+  S.saving = key;
+  note('saving…');
+  try {
+    await writeOp(OP_FAN_HEADER, slot, ...encodeRecord(h));
+    if (!S.saChr) { S.saving = null; note('saved', 'ok'); onSaved?.(key); return; }
+    clearTimeout(saveTimer);
+    saveTimer = setTimeout(() => {
+      if (S.saving !== key) return;
+      S.saving = null;
+      note('the receiver did not confirm the change', 'err');
+    }, SAVE_TIMEOUT_MS);
+  } catch (e) {
+    if (e === SUPERSEDED) return;
+    S.saving = null;
+    note('refused by the receiver — a pin it can’t use, a bad curve, or a value out of range', 'err'); // writeOp said more
+  }
+}
+
+// a card's fan in the daemon's short keys (fans.hpp): everything that
+// applies to it, so the daemon holds the whole fan to its rules
+function fanEdit(h) {
+  const e = { n: h.name.trim(), o: h.output, i: srcText(h) };
+  if (!watchOnly(h)) e.f = h.fallback;
+  if (!isFixed(h) && !watchOnly(h)) e.c = curveText(h.pts); // a watch-only fan's stays as the config has it
+  if (hasBoost(h)) e.b = h.boost === NONE ? null : h.boost;
+  if (hasHyst(h)) e.h = h.hyst;
+  if (hasRamp(h)) e.r = h.ramp;
+  if (hasBoostSecs(h)) e.t = h.boostSecs;
+  return e;
+}
+
+// the editor's Save: the working copy `h` of card `key` ('new' = an added fan)
+export function saveFan(key, h) {
+  h.pts.sort((a, b) => a.x - b.x);
+  const bad = checkEdit(h, key);
+  if (bad) { note(bad, 'err'); return; }
+  if (h.route !== 'daemon') { writeRecord(h.slot, h, key); return; }
+  if (!S.cfg) return;
+  writeCfg(key, key === 'new' ? { rev: S.cfg.rev, add: fanEdit(h) } : { rev: S.cfg.rev, fan: h.index, edit: fanEdit(h) });
+}
+
+// the editor's Delete
+export function deleteFan(key) {
+  const c = cardOf(key);
+  if (!c) return;
+  if (c.route !== 'daemon') { writeRecord(c.slot, null, key); return; }
+  if (S.cfg) writeCfg(key, { rev: S.cfg.rev, del: c.index });
+}
+
+// ---- power switch edits ----
+// what the daemon and the receiver refuse (tools/pwrcfg.py's ranges), said here first
+export function checkPower(t) {
+  if (!(t.hold >= 0.1 && t.hold <= 65.535)) return 'hold is 0.1–65 seconds';
+  if (!(t.boot >= 1 && t.boot <= 65.535)) return 'the boot timeout is 1–65 seconds';
+  for (const v of [t.low, t.high]) if (!(Number.isInteger(v) && v >= 0 && v <= 65535)) return 'thresholds are whole millivolts';
+  if (t.low >= t.high) return 'the down threshold must be below the up threshold';
+  return '';
+}
+
+// the editor's Save: `t` = { hold, boot (seconds), low, high (mV), wake (a
+// GPIO, null, or undefined = unchanged), shortPress (a command, null, or
+// undefined = unchanged) }, routed by powerRoute() — except the wake pin,
+// which goes by wakeRoute(): straight to the receiver first when the daemon
+// can't carry it, then the rest as usual
+export async function savePower(t) {
+  const bad = checkPower(t);
+  if (bad) { note(bad, 'err'); return; }
+  const route = powerRoute();
+  if (route === 'readonly') { note('settings are read-only right now', 'err'); return; }
+  const wakeHere = t.wake !== undefined && wakeRoute() === 'receiver';
+  if (wakeHere && !(await writeWake(t.wake))) return; // it said why
+  if (route === 'daemon') {
+    const e = { hold_seconds: t.hold, boot_timeout_seconds: t.boot, sense_low_mv: t.low, sense_high_mv: t.high };
+    if (t.wake !== undefined && !wakeHere) { e.wake = t.wake; setTimeout(checkWakeLanded, WAKE_LANDED_MS); }
+    if (t.shortPress !== undefined) e.short_press = t.shortPress;
+    writeCfg('p', e, VIEW.power);
+    return;
+  }
+  writeTuning(t);
+}
+
+// a wake pin routed through the daemon is written into the config and pushed
+// before the receiver has had its say; a pin the receiver refuses stays in
+// the config while the receiver keeps its old one. The receiver's view
+// (notified within a second) is the truth — compare once the dust settles
+const WAKE_LANDED_MS = 3000;
+function checkWakeLanded() {
+  if (!connected() || !S.pwr || !S.pcfg || S.pcfg.wake === undefined || S.pwr.pins.wake === S.pcfg.wake) return;
+  const had = S.pwr.pins.wake === null ? 'no wake input' : `GPIO${S.pwr.pins.wake}`;
+  note(`the receiver kept ${had} — it can’t use GPIO${S.pcfg.wake} for the wake input; the config now says ${S.pcfg.wake}`, 'err');
+}
+
+// the wake pin straight to the receiver: it checks the pin itself (a
+// refusal comes back as a write error) and applies it within a poll; the
+// pwr value's next notification shows it, and the free-pin list follows.
+// True when the write went through.
+async function writeWake(pin) {
+  if (!S.ctrl || S.saving !== null) return false;
+  try {
+    await writeOp(OP_PWR_WAKE, pin === null ? NONE : pin);
+    return true;
+  } catch (e) {
+    if (e !== SUPERSEDED) note('refused by the receiver — a pin it can’t use for the wake input', 'err'); // writeOp said more
+    return false;
+  }
+}
+
+// straight to the receiver: it validates the set itself (a refusal comes back
+// as a write error) and applies it within a poll, so the write's success is
+// the answer; the pwr value's next notification shows the stored values
+async function writeTuning(t) {
+  if (!S.ctrl || S.saving !== null) return;
+  const u16 = v => [v & 0xFF, (v >> 8) & 0xFF];
+  S.saving = 'p';
+  note('saving…');
+  try {
+    await writeOp(OP_PWR_TUNING, ...u16(Math.round(t.hold * 1000)), ...u16(Math.round(t.boot * 1000)), ...u16(t.low), ...u16(t.high));
+    settled('p');
+  } catch (e) {
+    if (e === SUPERSEDED) return;
+    S.saving = null;
+    note('refused by the receiver — a value out of its range', 'err'); // writeOp said more
+  }
+}
+
+// ---- the strip ----
+// The daemon's strip view (daemon/strip_remote.hpp): the strip block's knobs
+// and the scenes. There is no Save: a slider applies on release, a switch on
+// the tap — the daemon corrects the live strip at once and writes the value
+// into its config, and the answering view is what says "saved". Edits that
+// land while one is in flight are merged and sent when the answer comes.
+let sSaving = false, sInflight = null, sPending = null, sTimer = 0;
+export const hex2 = v => Math.max(0, Math.min(255, Math.round(v))).toString(16).padStart(2, '0');
+
+export function parseStripCfg(text) {
+  let j;
+  try { j = JSON.parse(text); } catch { return null; }
+  if (!j || typeof j !== 'object') return null;
+  const g = String(j.gamma ?? '2.2').trim().split(/\s+/).map(parseFloat).filter(x => !isNaN(x));
+  const gamma = g.length === 3 ? g : [g[0] ?? 2.2, g[0] ?? 2.2, g[0] ?? 2.2];
+  const w = String(j.white_balance ?? 'ffffff').replace('#', '').padStart(6, 'f');
+  const wb = [0, 2, 4].map(i => parseInt(w.substr(i, 2), 16) || 0);
+  return { editable: !!j.editable, leds: +j.leds || 0, pin: +j.pin || 0, reverse: !!j.reverse,
+           brightness: Math.max(0, Math.min(1, +j.brightness || 0)), gamma, wb,
+           scenes: Array.isArray(j.scenes) ? j.scenes.filter(s => s && typeof s.p === 'string').map(s => ({
+             p: s.p, e: String(s.e || ''), on: !!s.on,
+             color: typeof s.color === 'string' ? s.color.replace('#', '') : null,
+             l: typeof s.l === 'number' ? s.l : null })) : [] };
+}
+
+function stripReset() {
+  S.scfg = null; sSaving = false; sInflight = null; sPending = null;
+  clearTimeout(sTimer);
+}
+
+// does the daemon's view carry the edit? The view is also pushed unsolicited
+// (a scene's file appearing or disappearing), so an answer is recognised by
+// its content, not its arrival; a refused edit sends nothing and times out.
+const near = (a, b) => Math.abs(a - b) < 0.006;
+function reflects(v, edit) {
+  if ('brightness' in edit && !near(v.brightness, edit.brightness)) return false;
+  if ('reverse' in edit && v.reverse !== edit.reverse) return false;
+  if ('white_balance' in edit && v.wb.map(hex2).join('') !== edit.white_balance.toLowerCase()) return false;
+  if ('gamma' in edit) {
+    const g = String(edit.gamma).split(/\s+/).map(parseFloat);
+    const want = g.length === 3 ? g : [g[0], g[0], g[0]];
+    if (!want.every((x, i) => near(x, v.gamma[i]))) return false;
+  }
+  for (const e of edit.scenes || []) {
+    const s = v.scenes.find(x => x.p === e.p);
+    if (!s) return false;
+    if ('on' in e && s.on !== e.on) return false;
+    if ('color' in e && s.color !== e.color.toLowerCase()) return false;
+    if ('l' in e && !near(s.l, e.l)) return false;
+  }
+  return true;
+}
+
+export function onStripCfg(dv) {
+  S.scfg = dv.byteLength ? parseStripCfg(utf8.decode(dv)) : null;
+  if (sSaving && S.scfg && reflects(S.scfg, sInflight)) {
+    sSaving = false; sInflight = null;
+    clearTimeout(sTimer);
+    note('saved', 'ok');
+    if (sPending) { const e = sPending; sPending = null; writeStrip(e); }
+  }
+  emit();
+}
+
+// merge a partial edit into another (scenes by path)
+function mergeStrip(into, edit) {
+  for (const k in edit) {
+    if (k !== 'scenes') { into[k] = edit[k]; continue; }
+    into.scenes ||= [];
+    for (const s of edit.scenes) {
+      const have = into.scenes.find(x => x.p === s.p);
+      if (have) Object.assign(have, s); else into.scenes.push({ ...s });
+    }
+  }
+  return into;
+}
+// the edits the daemon hasn't answered yet, merged — their fields hold
+export const pendingStrip = () => mergeStrip(mergeStrip({}, sInflight || {}), sPending || {});
+
+export async function writeStrip(edit) {
+  if (!S.viewsChr || !S.scfg || !S.scfg.editable) return;
+  if (sSaving) { sPending = mergeStrip(sPending || {}, edit); return; }
+  const buf = viewEdit(VIEW.strip, edit);
+  if (!buf) { note('that edit is too long to send', 'err'); return; }
+  sSaving = true; sInflight = edit;
+  note('saving…');
+  try {
+    await gattWrite(S.viewsChr, buf);
+    clearTimeout(sTimer);
+    sTimer = setTimeout(() => {
+      if (!sSaving) return;
+      sSaving = false; sInflight = null; sPending = null;
+      note('no answer from the host', 'err');
+    }, SAVE_TIMEOUT_MS);
+  } catch (e) {
+    if (e === SUPERSEDED) return; // the switch reset the strip's state already
+    sSaving = false; sInflight = null; sPending = null;
+    if (tokenRejected(e)) { note('token rejected', 'err'); S.editToken = true; emit(); }
+    else note(`write failed: ${e.message}${writeHint(e)}`, 'err');
+  }
+}
+
+// ---- Steam ----
+// The daemon's Steam views (daemon/steam_remote.hpp): what Steam is doing,
+// and the installed games. The games are also kept on this phone, per
+// receiver, so the list is there while the host is off. A request (launch,
+// quit, pause, resume) carries an id and is resent until the daemon's view
+// echoes it — while the host boots (a launch from off powers it on first) no
+// daemon listens and the receiver drops the write. Once echoed the daemon
+// owns it (a launch waits there for Steam), and the outcome comes back in
+// the same view.
+const STEAM_RESEND_MS = 3000, STEAM_WAIT_MS = 4 * 60 * 1000;
+const libKey = id => `steam-lib-${id}`;
+let sReq = null, steamTimer = 0; // the request waiting on its echo or outcome: { id, op, a, dev, until, echoed }
+
+export function parseSteam(text) {
+  let j;
+  try { j = JSON.parse(text); } catch { return null; }
+  if (!j || typeof j !== 'object') return null;
+  const app = x => x && typeof x === 'object' && Number.isInteger(x.a) ? { a: x.a, n: String(x.n || '') } : null;
+  const l = j.launch, d = j.dl, r = j.req;
+  return { port: !!j.port, steam: !!j.steam, playing: Array.isArray(j.playing) ? j.playing.map(app).filter(Boolean) : [],
+           launch: l && Number.isInteger(l.a) ? { a: l.a, task: String(l.task || ''), p: typeof l.p === 'number' ? l.p : null } : null,
+           dl: app(d) ? { ...app(d), p: +d.p || 0, paused: !!d.paused, q: +d.q || 0 } : null,
+           req: r && Number.isInteger(r.id) ? { id: r.id, op: String(r.op || ''), a: +r.a || 0, st: String(r.st || ''), err: String(r.err || '') } : null };
+}
+export function parseLibrary(text) {
+  let j;
+  try { j = JSON.parse(text); } catch { return null; }
+  if (!j || !Array.isArray(j.games)) return null;
+  return { games: j.games.filter(g => g && Number.isInteger(g.a) && typeof g.n === 'string').map(g => ({ a: g.a, n: g.n, t: +g.t || 0, ...(typeof g.h === 'string' && { h: g.h }) })),
+           more: +j.more || 0 };
+}
+
+// the games: the daemon's list, else the one this phone kept for the receiver
+export function library() {
+  if (S.lib) return S.lib;
+  const id = currentId();
+  return id ? parseLibrary(store.get(libKey(id))) : null;
+}
+export const gameName = a => library()?.games.find(g => g.a === a)?.n ?? (S.steam?.playing.find(g => g.a === a)?.n ?? `app ${a}`);
+// Steam's state is only news while the host is up: the receiver keeps the
+// daemon's last word through a shutdown
+export const steamLive = () => S.psu === 2 && S.steam ? S.steam : null;
+export const steamWaiting = () => !!sReq && !sReq.echoed;
+
+function onLibrary(dv) {
+  const t = json(dv), lib = t === null ? null : parseLibrary(t);
+  if (lib && S.device) { S.lib = lib; store.set(libKey(S.device.id), t); }
+  emit();
+}
+
+const STEAM_DONE = { launch: r => `started ${gameName(r.a)}`, quit: r => `quit ${gameName(r.a)}`,
+                     pause: () => 'downloads paused', resume: () => 'downloads resumed' };
+function onSteam(dv) {
+  const t = json(dv);
+  S.steam = t === null ? null : parseSteam(t);
+  const r = sReq, got = S.steam?.req;
+  if (r && got && got.id === r.id) {
+    r.echoed = true;
+    clearTimeout(steamTimer);
+    if (got.st === 'done') { sReq = null; note(STEAM_DONE[r.op](r), 'ok'); }
+    else if (got.st === 'failed') { sReq = null; note(got.err || 'Steam refused it', 'err'); }
+    else if (r.op === 'launch' && S.note?.text !== `starting ${gameName(r.a)}…`) note(`starting ${gameName(r.a)}…`);
+  }
+  emit();
+}
+
+export async function steamRequest(op, a = 0) {
+  if (!connected() || (sReq && !sReq.echoed)) return; // an echoed one is the daemon's now: a new one replaces it there
+  sReq = { id: 1 + Math.floor(Math.random() * 0x7FFFFFFE), op, a, dev: S.device.id, until: Date.now() + STEAM_WAIT_MS, echoed: false };
+  if (op === 'launch' && S.psu === 0) { note(`powering on for ${gameName(a)}…`); await power(OP_ON); }
+  else note(op === 'launch' ? `starting ${gameName(a)}…` : 'asking Steam…');
+  steamPump();
+}
+
+// one send of the request in hand, while the host is up, and again until
+// the daemon echoes it
+async function steamPump() {
+  clearTimeout(steamTimer);
+  const r = sReq;
+  if (!r || r.echoed) return;
+  if (Date.now() > r.until) { sReq = null; note('no answer from the host', 'err'); return; }
+  if (S.device?.id === r.dev && connected() && S.viewsChr && S.psu === 2) {
+    try { await gattWrite(S.viewsChr, viewEdit(VIEW.steam, r.a ? { id: r.id, op: r.op, a: r.a } : { id: r.id, op: r.op })); }
+    catch (e) {
+      if (tokenRejected(e)) { sReq = null; note('token rejected', 'err'); S.editToken = true; emit(); return; }
+    } // anything else: the next send tries again
+  }
+  if (sReq === r && !r.echoed) steamTimer = setTimeout(steamPump, STEAM_RESEND_MS);
+}
+
+// ---- lifecycle ----
+document.addEventListener('visibilitychange', () => {
+  // Chrome silently stops background scans: abort ours so the attempt
+  // settles cleanly, and start a fresh one when the tab returns
+  if (document.visibilityState === 'visible') resume();
+  else watchAbort?.abort();
+});
+// Android Chrome can keep a reloaded or closed page's link open, and the
+// receiver takes one connection at a time — it stops advertising, and the
+// next page waits for it forever
+window.addEventListener('pagehide', () => { try { if (S.device?.gatt.connected) S.device.gatt.disconnect(); } catch {} });
+window.addEventListener('pageshow', e => { if (e.persisted) resume(); });
+
+export function boot() {
+  if (!HAS_BT)
+    say(IOS
+      ? 'Safari has no Web Bluetooth. Open this page in ' +
+        `<a href="${bluefyLink()}">Bluefy</a>, a free browser that has it ` +
+        `(<a href="${BLUEFY_STORE}">App Store</a>), and bookmark it there.`
+      : 'No Web Bluetooth here — use Chrome or Edge.', false, true);
+  else resume();
+  if ('serviceWorker' in navigator) {
+    // A new worker (a deploy) claims this page after the old cache already
+    // served it — reload once so the update shows now, not on the next open.
+    // No controller yet = first install, nothing stale to replace.
+    if (navigator.serviceWorker.controller)
+      navigator.serviceWorker.addEventListener('controllerchange', () => location.reload(), { once: true });
+    navigator.serviceWorker.register('sw.js').catch(() => {});
+  }
+}
